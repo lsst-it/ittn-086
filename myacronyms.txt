@@ -5,3 +5,15 @@
 #
 # Example:
 #   MIA:Missing In Action
+CLT:Chile Standard Time (UTC-4)
+GMT:Greenwich Mean Time
+CNPG:CloudNativePG, the Kubernetes operator managing PostgreSQL clusters
+HA:High Availability
+IPMI:Intelligent Platform Management Interface
+LB:Load Balancer
+LSN:Log Sequence Number, a position in the PostgreSQL write-ahead log
+PITR:Point-In-Time Recovery
+PVC:Persistent Volume Claim (Kubernetes)
+QoS:Quality of Service
+S3:Simple Storage Service (S3-compatible object storage)
+WAL:Write-Ahead Log

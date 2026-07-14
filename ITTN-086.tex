@@ -1,7 +1,8 @@
-\documentclass[PMO,lsstdraft,authoryear,toc]{lsstdoc}
+\documentclass[PMO,authoryear,toc]{lsstdoc}
 \input{meta}
 
 % Package imports go here.
+\usepackage{longtable}
 
 % Local commands go here.
 
@@ -9,12 +10,12 @@
 %\input{aglossary.tex}
 %\makeglossaries
 
-\title{Incident Report}
+\title{Summit CNPG Incident Report}
 
 % This can write metadata into the PDF.
 % Update keywords and author information as necessary.
 \hypersetup{
-    pdftitle={Incident Report},
+    pdftitle={Summit CNPG Incident Report},
     pdfauthor={DiegoTapia},
     pdfkeywords={}
 }
@@ -33,7 +34,7 @@
 % \setDocCurator{The Curator of this Document}
 
 \setDocAbstract{%
-Incident Report
+Summit CNPG Incident Report
 }
 
 % Change history defined here.
@@ -41,7 +42,7 @@ Incident Report
 % Fields: VERSION, DATE, DESCRIPTION, OWNER NAME.
 % See LPM-51 for version number policy.
 \setDocChangeRecord{%
-  \addtohist{1}{YYYY-MM-DD}{Unreleased.}{Tapia}
+  \addtohist{1}{2026-07-14}{Final Version.}{Diego Tapia}
 }
 
 
@@ -55,7 +56,456 @@ Incident Report
 % ADD CONTENT HERE
 % You can also use the \input command to include several content files.
 
+\section{Metadata}
+
+\begin{itemize}
+  \item \textbf{Incident ID:} 2026-07-02-2
+  \item \textbf{Title:} Data deletion in production CNPG PostgreSQL cluster
+        (yagan)
+  \item \textbf{Date:} 2026-07-02 (detected; data loss occurred 2026-07-01)
+  \item \textbf{Duration:} 2026-07-01 (data loss) $\rightarrow$ 2026-07-02
+        (detected) $\rightarrow$ 2026-07-03 (restored service verified,
+        independent backups live) $\rightarrow$ 2026-07-08 (USDF replication
+        restored)
+  \item \textbf{Major Incident?} Yes
+  \item \textbf{Incident Coordinator:} Diego Tapia
+\end{itemize}
+
+\section{Summary}
+
+Data on the production CloudNativePG PostgreSQL cluster on yagan
+(\texttt{cnpg-cluster}, namespace \texttt{cloudnativepg}) was discovered
+missing on 2026-07-02. The loss was caused by an automatic failover to a stale
+replica, triggered when all yagan nodes were hard-reset simultaneously during
+scheduled OS updates on 2026-07-01.
+
+Recovery was performed by deploying a parallel CNPG instance
+(\texttt{cnpg-cluster-cp}, namespace \texttt{cloudnativepg-cp}) on the same
+cluster and restoring the last scheduled backup (2026-07-01 9:00 AM CLT). The
+restore completed in 3h 49m with no data-load errors; the restored copy was
+verified at row level against production, scaled to a 3-instance HA topology,
+and equipped with its own backup pipeline to a dedicated bucket.
+
+\section{Timeline}
+
+\begin{longtable}{p{0.17\textwidth}p{0.76\textwidth}}
+\hline
+\textbf{Time (CLT)} & \textbf{Event} \\
+\hline
+\endhead
+2026-07-01 9:00 AM & Last scheduled backup dumps production cluster (30 GiB,
+  last known-good snapshot) \\
+2026-07-01 12:08 PM & All 20 yagan nodes hard-reset simultaneously for OS
+  updates via Foreman (\texttt{ipmitool chassis power reset | reboot -h now},
+  Evidence D) --- no drain, no switchover. \\
+2026-07-01 12:18 PM & Unplanned failover: \texttt{cnpg-cluster-12} promoted to
+  primary (16:18:41 UTC, timeline 11 $\rightarrow$ 12; Evidence A), ten
+  minutes after the reboot job started. The data loss occurs at this moment. \\
+2026-07-02 8:00 AM & Incident detected --- user reports problems with Rapid
+  Analysis with the error
+  \texttt{lsst.daf.butler.\_exceptions.MissingDatasetTypeError: "Dataset type
+  'intrinsicZernikes' does not exist."} Other reports around the same time
+  frame of data missing from various other databases. \\
+2026-07-02 10:31 AM & Investigation started: inconsistencies found in the CNPG
+  cluster via \texttt{kubectl cnpg status cnpg-cluster -n cloudnativepg} ---
+  all replicas in file-based standby and behind the primary instance
+  (Evidence A). \\
+2026-07-02 11:18 AM & Replication normalized on production: stale file-based
+  replicas deleted and re-cloned from the primary (548 GB join). By 2:20 PM
+  both replicas were streaming, \texttt{Standby (async)}, lag 00:00:00
+  (Evidence B). This restored the cluster's health but not its data --- the
+  re-cloned replicas were copies of the stale promoted primary, confirming
+  recovery required a backup restore, not replication repair. \\
+2026-07-02 8:58 PM & Mitigation: parallel-instance recovery chosen (production
+  primary left untouched for forensics/rollback); Fleet bundle
+  \texttt{cnpg-cluster-new} created and validated on ruka (dev) first. \\
+2026-07-02 10:27 PM & \texttt{cnpg-cluster-cp} deployed to yagan (namespace
+  \texttt{cloudnativepg-cp}, LB 139.229.180.108, pooler .109). \\
+2026-07-02 11:21 PM & Restore started: 2026-07-01 backup dump streamed into
+  the new CNPG cluster (\texttt{tar -xOf <backup.tar> | psql}). \\
+2026-07-03 3:10 AM & Restore completed after 3h 49m (Evidence C). Log review:
+  no data-load errors; only 8 benign ``already exists'' collisions with
+  CNPG-provisioned roles/objects. \\
+2026-07-03 3:13 PM & Restore verified: missing data confirmed present by the
+  system owners. Deployment scaled to 3 instances (primary + 2 streaming
+  replicas); DNS record updated to point to the new LB IP. \\
+2026-07-03 6:30 PM & Incident resolved: ANALYZE was run on the data and users
+  confirmed they could run test images with minimal performance issues
+  (Slack). \\
+2026-07-08 12:30 PM & USDF replication restored: Pixel firewall rule updated
+  to point to the new LB IP; replication slots recreated and resynced with
+  USDF. \\
+\hline
+\end{longtable}
+
+\section{Impact}
+
+\textbf{Affected systems/services:}
+
+\begin{itemize}
+  \item Production PostgreSQL on yagan (\texttt{cnpg-cluster}, namespace
+        \texttt{cloudnativepg}) and the applications backed by it: ConsDB,
+        Butler, NarrativeLog, and Rapid Analysis (which depends on calibration
+        data stored in Butler).
+\end{itemize}
+
+\textbf{Data loss:}
+
+\begin{itemize}
+  \item Apparent loss at failover: several weeks of data --- the database
+        reverted to the promoted replica's freeze point.
+  \item Permanent loss after restoring the 2026-07-01 9:00 AM dump:
+        transactions committed between that backup and the failover, minus
+        data reingested afterward. The DM calibration team reingested enough
+        calibration data to be ready to go on sky (weather kept the dome
+        closed regardless).
+\end{itemize}
+
+\textbf{Users affected:} Operations
+
+\textbf{Visibility:} Internal only
+
+\section{Root Cause}
+
+The data loss was caused by an automatic failover to a stale replica,
+triggered when all yagan nodes were hard-reset simultaneously during the
+2026-07-01 OS updates. The promoted replica is believed to have fallen out of
+streaming replication weeks earlier, likely since a previous maintenance.
+
+What is established: on 2026-07-01 at 12:08 PM, all 20 yagan nodes were
+hard-reset simultaneously via Foreman (\texttt{ipmitool chassis power reset},
+Evidence D) --- a hardware-level power cycle with no node drain, no controlled
+switchover, and no graceful OS or PostgreSQL shutdown. Ten minutes later, at
+12:18:41 PM, \texttt{cnpg-cluster-12} was promoted to primary, forking the
+cluster onto timeline 12 (Evidence A). The scale of the missing data implies
+the promoted replica had stopped receiving Write-Ahead Log (WAL) weeks before
+the reboot. What remains unclear is when and why it originally lost streaming
+replication.
+
+No status capture exists from before the maintenance --- the earliest evidence
+is the \texttt{cnpg status} output from the morning of 2026-07-02 (Evidence
+A), taken after the failover had already occurred. That snapshot shows the two
+remaining replicas in \texttt{Standby (file based)}. On a cluster with WAL
+archiving, that state means a replica is catching up from the archive and
+typically trails the primary by minutes to hours. Currently our cluster has no
+WAL archiving, so a replica that loses streaming receives no WAL at all and
+freezes at its last replayed position.
+
+Promotion of a stale replica causes data loss through the following sequence
+(standard PostgreSQL/CNPG behavior):
+
+\begin{itemize}
+  \item The promoted replica becomes the new primary on a new timeline, forked
+        at its last replayed position (LSN). All transactions committed on the
+        old primary after that fork point cease to be part of the cluster's
+        history.
+  \item The remaining replicas re-align to the new primary via
+        \texttt{pg\_rewind} or re-clone, discarding any WAL they held beyond
+        the fork point. At this step, data that existed on multiple nodes is
+        physically removed.
+  \item When the former primary rejoined the cluster as a replica, it was
+        rewound/re-cloned to follow the new (older) timeline. Until this
+        moment, the lost transactions still existed on its disk and were
+        recoverable; this step physically deleted the only remaining copy. The
+        reboot did not destroy the data --- the automated re-attachment of the
+        old primary did.
+\end{itemize}
+
+\subsection{Systemic root cause}
+
+The failover-to-stale-replica sequence above is the technical cause, but the
+incident was made possible by known, preventable gaps: no replication-state
+alerting, no WAL archiving or PITR, no restore runbook, no data-loss
+detection, and maintenance tooling that hard-resets database nodes. These gaps
+share a single origin: Rubin's DevOps team is severely understaffed relative
+to the hundreds of observatory components it operates, and with current
+staffing, defensive engineering work of this kind is consistently deferred in
+favor of keeping daily operations running. The previous occurrence of this
+same failure mode went under-investigated for the same reason, and the same
+constraint shaped the response --- a single engineer designed and executed the
+entire recovery under pressure, with no second responder available (see
+Scorecard).
+
+\section{Resolution}
+
+\begin{enumerate}
+  \item Production primary instance left untouched (no in-place restore risk);
+        the stale replicas had been deleted and re-cloned earlier during
+        investigation to restore streaming replication (Evidence B).
+  \item New Fleet bundle \texttt{cnpg-cluster-new} (k8s-cookbook): parallel
+        CNPG cluster \texttt{cnpg-cluster-cp} in isolated namespace
+        \texttt{cloudnativepg-cp} with dedicated MetalLB IPs
+        (139.229.180.108/.109); validated end to end on the ruka dev cluster
+        before deploying to yagan.
+  \item 2026-07-01 backup restored by streaming the dump:
+        \texttt{tar -xOf <backup.tar> | psql -h 139.229.180.108 -U postgres
+        -d postgres}. Ran 2026-07-02 11:21 PM $\rightarrow$ 2026-07-03 3:10 AM
+        (3h 49m for $\sim$30 GiB). The restore log shows no data-load errors
+        --- only 8 benign ``already exists'' collisions with roles/objects
+        that CNPG pre-provisions in a fresh cluster (Evidence C).
+  \item Restore verified at row level with the system owners of each affected
+        database; missing data confirmed present.
+  \item Scaled to production-like HA topology: 3 instances (primary + 2
+        streaming replicas), pgbouncer pooler, monitoring via PodMonitor.
+  \item Dedicated backup pipeline deployed: new S3 bucket and credentials
+        (\texttt{cnpg-backups-yagan}), ExternalSecret + CronJob (twice daily),
+        verified end to end with a manual run on 2026-07-06.
+\end{enumerate}
+
+\section{Lessons Learned}
+
+\textbf{What went well:}
+
+\begin{itemize}
+  \item The backup existed, was intact, and restored cleanly --- first full
+        restore test of these backups, now proven (Evidence C)
+  \item Parallel-instance recovery meant zero additional risk to production,
+        and GitOps (Fleet) made it reviewable and reproducible
+  \item Dev-first validation (ruka) caught procedural gotchas before touching
+        yagan
+\end{itemize}
+
+\textbf{What could be improved:}
+
+\begin{itemize}
+  \item Detection was manual.
+  \item In a data-loss incident, PVCs should be preserved before normalizing
+        replication --- the diverged data lives on those disks, and re-cloning
+        the replicas during investigation removed potential forensic evidence.
+\end{itemize}
+
+\textbf{Gaps identified:}
+
+\begin{itemize}
+  \item No point-in-time recovery (WAL archiving not configured)
+  \item No data-loss alerting.
+  \item No documented restore runbook prior to this incident.
+  \item CNPG reported ``Cluster in healthy state'' throughout --- both with
+        frozen file-based replicas and after the data loss --- so operator
+        status alone cannot detect this condition.
+  \item OS-update tooling defaults to hard power resets (Foreman + IPMI) run
+        against host groups that include database nodes --- unsafe for
+        stateful workloads regardless of replication health.
+  \item This happened to a lesser extent in a previous upgrade and a partial
+        restore was performed. A more thorough investigation should have been
+        done --- effort was lacking however.
+\end{itemize}
+
+\section{Preventive actions}
+
+To prevent recurrence of this failure mode, node maintenance involving
+database hosts will follow a controlled procedure that guarantees the primary
+always steps down cleanly and is never shut down while holding unreplicated
+data. Nodes hosting database instances are always maintained one at a time ---
+never rebooted simultaneously --- and are restarted with a graceful OS reboot
+after the node is drained. Hard resets (\texttt{ipmitool chassis power reset},
+Foreman power-cycle jobs) are not used on these nodes except as a last resort
+on an already-drained, unresponsive host.
+
+\subsection{Node maintenance procedure for CNPG database clusters}
+
+\textbf{Precondition (gate):} before any node is touched, verify cluster
+health with \texttt{kubectl cnpg status}:
+
+\begin{itemize}
+  \item Every replica must report \texttt{Standby (async)} (or
+        \texttt{Standby (sync)}) --- i.e., attached via \textbf{streaming
+        replication} --- with replication lag at or near zero. A replica
+        reporting \texttt{Standby (file based)} fails the gate: on clusters
+        without WAL archiving (currently all of ours), that state means the
+        replica is receiving no WAL at all and is frozen at its last replayed
+        position, not ``catching up.''
+  \item On clusters where WAL archiving \textbf{is} configured, continuous
+        archiving must also be reported healthy (recent successful archive,
+        no failing WALs).
+\end{itemize}
+
+If any replica fails these checks, maintenance does not proceed until
+replication is repaired and lag has returned to $\approx 0$. A lagging or
+frozen replica means the cluster has no safe failover target --- an unclean
+primary shutdown in this state is exactly the failure mode that caused this
+incident.
+
+\begin{enumerate}
+  \item \textbf{Replica nodes first.} For each node hosting a replica
+        instance:
+        \begin{itemize}
+          \item Drain the node (\texttt{kubectl cordon} +
+                \texttt{kubectl drain}), which shuts the Postgres pod down
+                cleanly; the data volume (PVC) remains intact.
+          \item Perform the OS update and reboot.
+          \item Uncordon the node and wait for the replica to rejoin the
+                cluster and fully catch up with the primary (streaming, lag
+                $\approx 0$, per \texttt{kubectl cnpg status}) before
+                proceeding to the next node.
+        \end{itemize}
+  \item \textbf{Controlled switchover.} Once all replica nodes are updated,
+        promote one of the caught-up replicas (\texttt{kubectl cnpg promote}).
+        This is a switchover, not a failover: the old primary confirms a fully
+        caught-up successor and hands off cleanly, with no risk of data loss.
+        Wait for the switchover to complete and the new primary to report
+        healthy.
+  \item \textbf{Former primary node last.} Drain the node that hosted the old
+        primary (now a replica), perform the OS update and reboot, uncordon,
+        and wait for the instance to rejoin and resynchronize with the
+        cluster.
+\end{enumerate}
+
+At no point in this procedure is a node rebooted while running a database
+instance, and the primary role is only ever transferred through a verified,
+caught-up successor.
+
+\section{Action Items}
+
+\begin{longtable}{p{0.60\textwidth}p{0.18\textwidth}p{0.10\textwidth}}
+\hline
+\textbf{Action} & \textbf{Owner} & \textbf{Priority} \\
+\hline
+\endhead
+Alert on any CNPG replica reporting \texttt{Standby (file based)} or
+  replication lag above threshold --- all CNPG clusters, all sites &
+  [Infrastructure] & High \\
+Configure WAL archiving / point-in-time recovery (barman object store) on all
+  production CNPG clusters & [Infrastructure] & High \\
+Add data-loss alerting to our monitoring stack & [Infrastructure] & High \\
+Foreman: separate DB-hosting nodes into their own host group excluded from
+  bulk power-cycle jobs; reboots of those nodes follow the CNPG
+  node-maintenance runbook & [Infrastructure] & High \\
+Publish the node-maintenance procedure above as a runbook and require it in
+  the OS-patching procedure for DB-hosting nodes & [Infrastructure] & Medium \\
+Write runbook: ``restore a CNPG backup to a parallel instance'' (from IT-6983
+  work) & [Infrastructure] & Medium \\
+\hline
+\end{longtable}
+
+\section{Incident Scorecard}
+
+\begin{longtable}{p{0.12\textwidth}p{0.14\textwidth}p{0.62\textwidth}}
+\hline
+\textbf{Category} & \textbf{Score} & \textbf{Notes} \\
+\hline
+\endhead
+People & Warning & Single engineer drove the entire recovery; no second
+  responder was available for review or relief during a $\sim$20-hour
+  incident. \\
+Process & Warning & No restore runbook or prior restore test existed; recovery
+  procedure had to be designed during the incident and under pressure. \\
+Tooling & Warning & Backups + GitOps + operator worked well (OK); but no
+  replication-state or data-loss alerting, and maintenance tooling defaults to
+  hard resets. \\
+\hline
+\end{longtable}
+
+\section{References}
+
+\begin{itemize}
+  \item \textbf{Related tickets/issues:} IT-6983,
+        \url{https://rubinobs.atlassian.net/browse/IT-6983}
+  \item \textbf{Communication threads:}
+        \href{https://rubin-obs.slack.com/archives/C07RV29CXSR/p1782994199506899}{incident thread}
+  \item \textbf{Evidence:} see Appendix (A: cnpg status at detection, B: cnpg
+        status after replication normalization, C: restore log, D: Foreman
+        reboot job)
+\end{itemize}
+
 \appendix
+
+\section{Evidence}
+
+\subsection{A. Production \texttt{cnpg status} at detection (2026-07-02
+\textasciitilde10:31 AM CLT)}
+
+Both replicas frozen in file-based standby, $\sim$180--200 GiB of WAL behind
+the primary, no WAL archiving --- while the operator reports the cluster
+healthy. The promotion time pins the failover to 2026-07-01 16:18:41 UTC
+(12:18 PM CLT), ten minutes after the Foreman reboot job (Evidence D) and
+$\sim$20 hours before the first user report.
+
+{\footnotesize
+\begin{verbatim}
+Cluster Summary
+Name                 cloudnativepg/cnpg-cluster
+System ID:           7533252439990886430
+PostgreSQL Image:    docker.io/lsstit/cnpgsphere:16.8
+Primary instance:    cnpg-cluster-12
+Primary start time:  2026-07-01 16:18:41 +0000 UTC (uptime 21h52m10s)
+Status:              Cluster in healthy state
+Instances:           3
+Ready instances:     3
+Size:                549G
+Current Write LSN:   159C/3F014960 (Timeline: 12 - WAL File: 0000000C0000159C0000003F)
+
+Continuous Backup status
+Not configured
+
+Streaming Replication status
+Not available yet
+
+Instances status
+Name             Current LSN    Replication role      Status  QoS         Manager Version  Node
+----             -----------    ----------------      ------  ---         ---------------  ----
+cnpg-cluster-12  159C/3F014960  Primary               OK      Guaranteed  1.27.1           yagan13
+cnpg-cluster-13  156F/24000000  Standby (file based)  OK      Guaranteed  1.27.1           yagan14
+cnpg-cluster-11  156A/7E93EC00  Standby (file based)  OK      Guaranteed  1.27.1           yagan12
+\end{verbatim}
+}
+
+\subsection{B. Production \texttt{cnpg status} after replication normalization
+(2026-07-02 2:20 PM CLT)}
+
+After deleting the stale replicas, the operator re-cloned them from the
+primary (548 GB join per instance). Replication is structurally healthy again
+--- but the data is still missing: the replicas are copies of the stale
+promoted primary. This output is also the reference ``pass'' state for the
+maintenance-gate precondition in Preventive Actions.
+
+{\tiny
+\begin{verbatim}
+Cluster Summary
+Name                     cloudnativepg/cnpg-cluster
+System ID:               7533252439990886430
+PostgreSQL Image:        docker.io/lsstit/cnpgsphere:16.8
+Primary instance:        cnpg-cluster-12
+Primary promotion time:  2026-07-01 16:18:41 +0000 UTC (26h1m47s)
+Status:                  Cluster in healthy state
+Instances:               3
+Ready instances:         3
+Size:                    549G
+Current Write LSN:       159C/7200ED08 (Timeline: 12 - WAL File: 0000000C0000159C00000072)
+
+Continuous Backup not configured
+
+Streaming Replication status
+Replication Slots Enabled
+Name             Sent LSN       Write LSN      Flush LSN      Replay LSN     Write Lag  Flush Lag  Replay Lag  State      Sync State  Sync Priority  Replication Slot
+----             --------       ---------      ---------      ----------     ---------  ---------  ----------  -----      ----------  -------------  ----------------
+cnpg-cluster-14  159C/7200ED08  159C/7200ED08  159C/7200ED08  159C/7200ED08  00:00:00   00:00:00   00:00:00    streaming  async       0              active
+cnpg-cluster-15  159C/7200ED08  159C/7200ED08  159C/7200ED08  159C/7200ED08  00:00:00   00:00:00   00:00:00    streaming  async       0              active
+
+Instances status
+Name             Current LSN    Replication role  Status  QoS         Manager Version  Node
+----             -----------    ----------------  ------  ---         ---------------  ----
+cnpg-cluster-12  159C/7200ED08  Primary           OK      Guaranteed  1.27.1           yagan13
+cnpg-cluster-14  159C/7200ED08  Standby (async)   OK      Guaranteed  1.27.1           yagan14
+cnpg-cluster-15  159C/7200ED08  Standby (async)   OK      Guaranteed  1.27.1           yagan12
+\end{verbatim}
+}
+
+\subsection{C. Restore log (\texttt{restore-yagan.log})}
+
+Full psql output of the dump restore into \texttt{cnpg-cluster-cp}, 2026-07-02
+23:21 $\rightarrow$ 2026-07-03 03:10 (3h 49m, $\sim$30 GiB). No data-load
+errors; 8 benign ``already exists'' collisions with CNPG-provisioned
+roles/objects.
+
+\subsection{D. Foreman job --- yagan node reboots (2026-07-01)}
+
+Job ``\texttt{Run ipmitool chassis power reset | reboot -h now}'', started
+2026-07-01 12:08 PM (GMT-4), effective user root, template ``Run Command --
+Script Default'', targeting all 20 yagan hosts simultaneously. Result: 16
+succeeded, 4 failed (yagan13, yagan17, yagan18, yagan19). The unplanned
+primary promotion (Evidence A) occurred at 12:18:41 PM CLT --- ten minutes
+after the job started.
 
 \section{Acknowledgements}
 

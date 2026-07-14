@@ -4,13 +4,13 @@
    :target: https://github.com/lsst-it/ittn-086/actions/
 
 ###############
-Incident Report
+Summit CNPG Incident Report
 ###############
 
 ITTN-086
 ========
 
-Incident Report
+Summit CNPG Incident Report
 
 Links
 =====
